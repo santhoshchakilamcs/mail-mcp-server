@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mail-mcp-server
+  labels:
+    app: mail-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mail-mcp-server
+  template:
+    metadata:
+      labels:
+        app: mail-mcp-server
+    spec:
+      containers:
+        - name: server
+          # Build and push this image first: docker build -t mail-mcp-server:latest .
+          image: mail-mcp-server:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-m", "src.server", "--http", "--port", "8000"]
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: mail-mcp-config
+          # The MCP endpoint is POST-only, so probes use the TCP socket.
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

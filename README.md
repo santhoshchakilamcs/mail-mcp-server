@@ -1,0 +1,197 @@
+# mail-mcp-server
+
+An MCP server that turns a mailbox into tools an AI agent can use: search,
+read, triage, label, prioritize, and summarize email, plus an evaluation
+harness that measures the agent's work against independent ground truth and
+fails the run if quality regresses.
+
+Built with the Model Context Protocol Python SDK 2.x (`mcp==2.3.0`).
+Runs over stdio, the standard MCP transport, so any MCP client
+(Claude Desktop, Cursor, an agent harness) can connect to it — and a Go
+client (`go-client/`, official Go MCP SDK v1.8.0) proves the same server
+speaks MCP to a second language. For containers it also serves streamable
+HTTP (`--http`, port 8000) with Kubernetes manifests in `k8s/`.
+
+## What it does
+
+**Tools** (8)
+
+| Tool | What it does |
+| --- | --- |
+| `search_mail(query, limit)` | Substring search over subject and body, newest first |
+| `get_message(message_id)` | Full message: sender, subject, date, body, stored label |
+| `classify_message(message_id)` | The server's triage label, with reasons |
+| `label_message(message_id, label)` | Apply a triage label (persists in the local DB) |
+| `suggest_priority(message_id)` | Priority score 0-100 and band (high/medium/low), with reasons |
+| `summarize_message(message_id)` | Extractive summary (first sentences of the body) |
+| `inbox_stats()` | Counts by label and priority band, top senders |
+| `cache_stats()` | Redis search-cache status: enabled, hits, misses, hit rate, TTL |
+
+**Resources** (2): `mail://stats` (inbox statistics), `mail://message/{id}`
+(one message as JSON).
+
+**Prompts** (2): `triage-inbox` (walk an agent through triaging the inbox),
+`draft-follow-up` (draft a reply to a message).
+
+## Stack
+
+- **MCP server** — Python, MCP SDK 2.3.0, stdio by default, streamable HTTP
+  with `--http`.
+- **Go client** — `go-client/` (Go 1.27, MCP Go SDK v1.8.0) spawns the Python
+  server over stdio, lists tools, searches, and scores priority.
+  `go test ./...` in `go-client/` covers both calls end to end.
+- **Storage** — SQLite by default; Postgres via `MAIL_MCP_BACKEND=postgres`
+  and `MAIL_MCP_DSN` (`src/mailbox_pg.py`, same interface, same policy, same
+  search semantics — `ILIKE` in Postgres matches the SQLite `LIKE ... COLLATE
+  NOCASE`). The 40-task eval passes on both backends.
+- **Cache** — Redis search cache (`src/cache.py`, `MAIL_MCP_REDIS_URL`):
+  search results cached 300 s, hits/misses counted and exposed by
+  `cache_stats`. A repeated search is served from cache (verified: the
+  second and third identical searches are hits). Cache keys are namespaced
+  per mailbox (SQLite path or Postgres DSN), so different mailboxes cannot
+  poison each other. The cache fails open: if Redis is unreachable, searches
+  run uncached instead of breaking.
+- **Deployment** — `Dockerfile` (Python 3.12-slim, non-root, HTTP mode),
+  `docker-compose.yml` (server + Postgres 16 + Redis 7 with healthchecks and
+  a one-off `loader` service that loads the corpus), and `k8s/` (server
+  Deployment + Service, Postgres Deployment + Service + PVC, Redis
+  Deployment + Service, ConfigMap, Kustomization — validated with
+  `kubectl kustomize` and kubeconform strict schema checks, 8 resources).
+
+## Data
+
+The demo mailbox is the Apache SpamAssassin public corpus, `easy_ham`:
+**2,551 real messages** (Aug 2002, mostly developer mailing lists and RSS
+digests), downloaded from
+`https://spamassassin.apache.org/old/publiccorpus/20021010_easy_ham.tar.bz2`
+(SHA-256 `f9fc56e1f68780f9afdc6d23a2e24c4584af988afc58bbfabae500e51f3a2f36`).
+
+The corpus is a build artifact, not in the repo: `scripts/build_mailbox.py`
+downloads it, parses it with the standard-library `email` package, and loads
+it into a local SQLite database (`data/mailbox.db`, also not in the repo) or
+into Postgres (`--backend postgres --dsn ...`).
+A fresh clone regenerates both with `./run.sh build`.
+
+Label distribution after loading: newsletter 1,724, personal 796,
+follow-up 28, automated 3. Priority bands: high 201, medium 641, low 1,709.
+Scores range 0-90.
+
+## Triage policy
+
+Labels, in order:
+
+1. **automated** — sender is a no-reply/daemon/postmaster address, or the
+   subject is an auto-reply.
+2. **newsletter** — mailing-list headers (`List-Id`, `List-Unsubscribe`,
+   or `Precedence: bulk/list/junk`).
+3. **follow-up** — a reply/forward subject (`Re:`/`Fwd:`/`Fw:`) that asks a
+   question (`?` anywhere in the body).
+4. **personal** — everything else.
+
+Priority score (0-100), band high >= 60, medium 30-59, low < 30:
+
+| Signal | Points |
+| --- | --- |
+| personal (not list mail) | +30 |
+| mailing-list mail | -20 |
+| frequent sender (>= 5 messages) | +15 |
+| urgent keywords (`urgent`, `action required`, `deadline`, `asap`, `meeting`, `follow up`, `reminder`) in subject/first 500 chars | +25 |
+| asks a question (`?` anywhere in the body) | +10 |
+| dated 2002 (the corpus year) | +10 |
+
+## Evaluation
+
+`eval/` holds a 40-task eval: 15 search-and-label tasks, 15 triage tasks,
+10 priority tasks. Ground truth in `eval/tasks.json` is generated by
+`eval/generate_tasks.py` from the raw corpus files and raw SQL, **without
+importing the server code** — it is a separate implementation of the same
+documented policy, so the eval measures whether the server actually follows
+the policy instead of testing the server against itself.
+
+`eval/run_eval.py` drives a deterministic agent (`src/agent.py`) over the
+tasks through the real MCP server (in-process transport), scores each task,
+writes `eval/results.json` and `eval/metrics.json`, and enforces a
+regression gate against `eval/baseline.json` (exit 1 on any regression).
+The eval runs against a throwaway copy of the database, so labeling tasks
+never mutate the committed database and repeated runs are identical.
+`verify_results.py` independently recomputes every score and aggregate
+from the artifacts, with no imports from `src/` or `eval/`. The eval runs
+unchanged against Postgres (`eval/run_eval.py --backend postgres`), using a
+scratch database that is dropped afterwards — same tasks, same numbers.
+
+**Verified results** (reproduced twice; `verify_results.py` passes):
+
+| Metric | Value |
+| --- | --- |
+| Overall accuracy | **1.00 (40/40)** |
+| Search-and-label accuracy | 1.00 (15/15) |
+| Triage accuracy | 1.00 (15/15) |
+| Priority-band accuracy | 1.00 (10/10) |
+| Mean search precision / recall / F1 | 1.00 / 1.00 / 1.00 |
+| Mean priority-score absolute error | 0.0 |
+
+The eval caught two real bugs before these numbers, both fixed and
+re-verified at 40/40: (1) the priority scorer only looked at the first 500
+characters for a question, missing questions later in the body (three
+tasks scored 10 points low); (2) message bodies were truncated at 4,000
+characters when stored, hiding a question at character 4,519 of an
+8,428-character message. Bodies are now stored in full.
+
+## Run it
+
+```bash
+./run.sh setup   # create .venv, install requirements
+./run.sh build   # download corpus, build mailbox.db, generate eval tasks
+./run.sh serve   # MCP server over stdio
+./run.sh serve-http  # MCP server over streamable HTTP on port 8000
+./run.sh eval    # run the 40-task eval (regression gate vs baseline)
+./run.sh verify  # independently recompute every recorded score
+./run.sh test    # pytest: 21 tests (incl. Postgres, Redis, HTTP-mode)
+./run.sh go-test # Go client tests (needs Go 1.27 on PATH)
+```
+
+Postgres + Redis locally (the compose stack, or any local services):
+
+```bash
+MAIL_MCP_BACKEND=postgres \
+MAIL_MCP_DSN=postgresql://mail_mcp:mail_mcp@localhost:5432/mail_mcp \
+  ./run.sh build --backend postgres   # load corpus into Postgres
+MAIL_MCP_DSN=postgresql://mail_mcp:mail_mcp@localhost:5432/mail_mcp \
+  .venv/bin/python eval/run_eval.py --backend postgres
+MAIL_MCP_REDIS_URL=redis://localhost:6379/0 ./run.sh serve
+```
+
+Connect from Claude Desktop (after `./run.sh build`):
+
+```json
+{
+  "mcpServers": {
+    "mail-mcp-server": {
+      "command": "/absolute/path/to/mail-mcp-server/.venv/bin/python",
+      "args": ["-m", "src.server"],
+      "cwd": "/absolute/path/to/mail-mcp-server"
+    }
+  }
+}
+```
+
+## Honest limits
+
+- The agent in `src/agent.py` is **deterministic and rule-based, not an LLM**:
+  it calls tools in a fixed sequence per task type. The eval harness is the
+  same shape as an LLM eval (tasks, ground truth, scoring, regression gate)
+  and the agent policy is swappable for an LLM-backed one without changing
+  the task format, but no LLM quality is measured here.
+- Search is substring matching, not semantic search or ranking.
+- The corpus is from 2002 and mailing-list heavy; it is a stand-in for a
+  real mailbox, not production email data.
+- Storage is local SQLite or a single Postgres instance; the Redis cache is
+  a demo-grade search cache, not a production caching layer. There is no
+  live mailbox connection, no auth, and no multi-user support. Single user,
+  local only.
+- The Dockerfile and compose file were validated as YAML and the k8s
+  manifests against the Kubernetes schemas, but the Docker image was **not
+  built in this sandbox** (no Docker daemon here) and the compose stack was
+  not run end to end — build the image and run the stack before relying on
+  them.
+- Summaries are extractive (first sentences), not abstractive.

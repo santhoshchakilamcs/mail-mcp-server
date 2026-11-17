@@ -1,0 +1,63 @@
+# Full local stack: MCP server (streamable HTTP) + Postgres + Redis.
+#
+#   docker compose up -d --build
+#   docker compose run --rm loader   # load the corpus into Postgres once
+#   curl -s -X POST localhost:8000/mcp -H 'Content-Type: application/json' \
+#     -H 'Accept: application/json, text/event-stream' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+#
+# The server also works with the baked-in SQLite mailbox: set
+# MAIL_MCP_BACKEND=sqlite and drop the depends_on (see README).
+services:
+  server:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      MAIL_MCP_BACKEND: postgres
+      MAIL_MCP_DSN: postgresql://mail_mcp:mail_mcp@postgres:5432/mail_mcp
+      MAIL_MCP_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  loader:
+    build: .
+    profiles: ["load"]
+    environment:
+      MAIL_MCP_DSN: postgresql://mail_mcp:mail_mcp@postgres:5432/mail_mcp
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["python", "scripts/build_mailbox.py", "--backend", "postgres"]
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mail_mcp
+      POSTGRES_PASSWORD: mail_mcp
+      POSTGRES_DB: mail_mcp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mail_mcp -d mail_mcp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

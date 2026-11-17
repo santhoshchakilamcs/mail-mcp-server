@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mail-mcp-config
+  labels:
+    app: mail-mcp-server
+data:
+  MAIL_MCP_BACKEND: "postgres"
+  MAIL_MCP_DSN: "postgresql://mail_mcp:mail_mcp@postgres:5432/mail_mcp"
+  MAIL_MCP_REDIS_URL: "redis://redis:6379/0"

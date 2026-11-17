@@ -1,0 +1,22 @@
+{
+  "total_tasks": 40,
+  "overall_accuracy": 1.0,
+  "by_type": {
+    "search_label": {
+      "n": 15,
+      "accuracy": 1.0
+    },
+    "triage": {
+      "n": 15,
+      "accuracy": 1.0
+    },
+    "priority": {
+      "n": 10,
+      "accuracy": 1.0
+    }
+  },
+  "mean_search_f1": 1.0,
+  "mean_search_precision": 1.0,
+  "mean_search_recall": 1.0,
+  "mean_priority_score_abs_error": 0.0
+}
